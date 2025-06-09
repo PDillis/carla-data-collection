@@ -1,0 +1,6 @@
+carla==0.9.15
+tqdm
+numpy
+matplotlib
+pillow
+pygame

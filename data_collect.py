@@ -129,6 +129,7 @@ class CarlaSensorDataCollector:
             self.client.set_timeout(10.0)
 
             # Load desired map if specified and different from current
+            current_map = self.client.get_world().get_map().name
             # available_maps = self.client.get_available_maps()
             # print("Available Maps:", available_maps)
             current_map = self.client.get_world().get_map().name
@@ -138,14 +139,34 @@ class CarlaSensorDataCollector:
             if not current_map.endswith(self.map_name):
                 print(f"Loading map {self.map_name}...")
                 self.world = self.client.load_world(self.map_name)
+
+                # CRITICAL: Reload the map to fix pedestrian spawning at wrong Z levels
+                # This is a known workaround for a CARLA bug
+                print(f"Reloading map {self.map_name} to fix pedestrian spawning...")
+                self.world = self.client.reload_world()
+
+                # Wait for the map to fully load and navigation mesh to initialize
+                print("Waiting for navigation mesh to initialize...")
+                for _ in range(10):  # Wait up to 10 ticks
+                    if self.sync:
+                        self.world.tick()
+                    else:
+                        time.sleep(0.1)
             else:
                 print(f"Map {self.map_name} is already loaded, using current map {current_map}")
                 self.world = self.client.get_world()
-            # Reload to fix a bug in CARLA 0.9.15 w/pedestrians not adhering to surface
-            # else:
-            #     self.world = self.client.get_world()
-            #     if desired_map != current_map:
-            #         print(f"Warning: Map {desired_map} not found or already loaded, using current map {current_map}")
+
+                # Even if the map is already loaded, reload it to ensure proper pedestrian spawning
+                print(f"Reloading current map to fix pedestrian spawning...")
+                self.world = self.client.reload_world()
+
+                # Wait for the map to fully load and navigation mesh to initialize
+                print("Waiting for navigation mesh to initialize...")
+                for _ in range(10):  # Wait up to 10 ticks
+                    if self.sync:
+                        self.world.tick()
+                    else:
+                        time.sleep(0.1)
 
             # Set up synchronous mode if requested
             settings = self.world.get_settings()
@@ -241,7 +262,42 @@ class CarlaSensorDataCollector:
                 self.ego_vehicle.set_location(ground_loc.location + carla.Location(z=0.01))
             self.autonomous_agent.follow_speed_limits(True)
         elif self.args.agent == "Behavior":
-            self.autonomous_agent = BehaviorAgent(self.ego_vehicle, behavior=self.args.behavior)
+            try:
+                self.autonomous_agent = BehaviorAgent(
+                    self.ego_vehicle,
+                    behavior=self.args.behavior
+                )
+
+                # IMPORTANT: Set target speed to avoid crashes
+                self.autonomous_agent.set_target_speed(self.args.max_speed)
+
+                # Get valid spawn points for destination
+                spawn_points = self.world.get_map().get_spawn_points()
+
+                # Choose a destination that's far enough from current position
+                current_location = self.ego_vehicle.get_location()
+                valid_destinations = [sp for sp in spawn_points
+                                      if sp.location.distance(current_location) > 50.0]
+
+                if valid_destinations:
+                    destination = random.choice(valid_destinations).location
+                else:
+                    # If no far destinations, just pick any other spawn point
+                    destination = random.choice([sp for sp in spawn_points
+                                                 if sp != spawn_points[self.spawn_point_idx]]).location
+
+                # Set the destination
+                self.autonomous_agent.set_destination(destination)
+                print(f"Behavior Agent destination set to {destination}")
+
+            except Exception as e:
+                print(f"Error setting up Behavior Agent: {e}")
+                print("Falling back to Autopilot mode")
+                self.ego_vehicle.set_autopilot(True, self.args.tm_port)
+                self.autonomous_agent = None
+                return
+
+
         else:
             raise ValueError(f"Unknown agent type: {self.args.agent}")
 
@@ -294,6 +350,24 @@ class CarlaSensorDataCollector:
 
             {'type': 'sensor.camera.semantic_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 46.0,
              'width': 960, 'height': 540, 'fov': 45, 'id': 'SS_right'},
+
+            # Instance Segmentation cameras
+            {'type': 'sensor.camera.instance_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+                'width': 960, 'height': 540, 'fov': 45, 'id': 'IS_central'},
+
+            {'type': 'sensor.camera.instance_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': -46,
+                'width': 960, 'height': 540, 'fov': 45, 'id': 'IS_left'},
+
+            {'type': 'sensor.camera.instance_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 46.0,
+                'width': 960, 'height': 540, 'fov': 45, 'id': 'IS_right'},
+
+            # BEV cameras, one RGB and one semantic segmentation
+            {'type': 'sensor.camera.rgb', 'x': 0, 'y': 0, 'z': 10, 'roll': 90.0, 'pitch': 90.0, 'yaw': 0.0,
+             'width': 960, 'height': 540, 'fov': 45, 'id': 'BEV_RGB'},
+
+            {'type': 'sensor.camera.semantic_segmentation', 'x': 0, 'y': 0, 'z': 10, 'roll': 90.0, 'pitch': 90.0, 'yaw': 0.0,
+             'width': 960, 'height': 540, 'fov': 45, 'id': 'BEV_SS'},
+
         ]
 
         # Create all sensors
@@ -319,7 +393,8 @@ class CarlaSensorDataCollector:
             # Set up callback to collect the data for each "camera" sensor
             if sensor_config['type'] in ['sensor.camera.rgb',
                                          'sensor.camera.depth',
-                                         'sensor.camera.semantic_segmentation']:
+                                         'sensor.camera.semantic_segmentation',
+                                         'sensor.camera.instance_segmentation']:
                 sensor.listen(lambda image, sensor_id=sensor_config['id']: self.camera_callback(image, sensor_id))
 
         # Wait for sensors to be ready
@@ -349,7 +424,9 @@ class CarlaSensorDataCollector:
         sensor_configs = {
             'RGB': {'palette': carla.ColorConverter.Raw, 'ext': 'jpg'},
             'DEPTH': {'palette': carla.ColorConverter.Depth, 'ext': 'png'},
-            'SS': {'palette': carla.ColorConverter.CityScapesPalette, 'ext': 'png'}
+            'SS': {'palette': carla.ColorConverter.CityScapesPalette, 'ext': 'png'},
+            'IS': {'palette': carla.ColorConverter.Raw, 'ext': 'png'},
+
         }
 
         for sensor_type, config in sensor_configs.items():
@@ -468,12 +545,24 @@ class CarlaSensorDataCollector:
 
         # 1. Take all the random locations to spawn
         spawn_points = []
-        for i in range(self.number_of_walkers):
+        attempts = 0
+        max_attempts = self.number_of_walkers * 3  # Try up to 3x the requested number
+
+        while len(spawn_points) < self.number_of_walkers and attempts < max_attempts:
             spawn_point = carla.Transform()
             loc = self.world.get_random_location_from_navigation()
-            if loc:
+            if loc is not None:
                 spawn_point.location = loc
                 spawn_points.append(spawn_point)
+            attempts += 1
+
+        if len(spawn_points) < self.number_of_walkers:
+            print(f"Warning: Could only find {len(spawn_points)} valid spawn points for pedestrians")
+            self.number_of_walkers = len(spawn_points)
+
+        if len(spawn_points) == 0:
+            print("Error: No valid spawn points found for pedestrians. Skipping pedestrian spawning.")
+            return
 
         # 2. Spawn walker objects
         batch = []
@@ -545,13 +634,41 @@ class CarlaSensorDataCollector:
         self.world.set_pedestrians_cross_factor(percentage_pedestrians_crossing)
 
         all_actors = self.world.get_actors(all_id)
+
+        # Initialize controllers with proper error handling
+        successful_walkers = 0
         for i in range(0, len(all_id), 2):
-            # Start walker
-            all_actors[i].start()
-            # Set walk to random point
-            all_actors[i].go_to_location(self.world.get_random_location_from_navigation())
-            # Set max speed
-            all_actors[i].set_max_speed(float(walker_speeds[int(i/2)]))
+            try:
+                controller = all_actors[i]
+                walker = all_actors[i + 1]
+
+                # Start walker
+                controller.start()
+
+                # Try to get a valid destination
+                destination = None
+                for _ in range(5):  # Try up to 5 times to get a valid destination
+                    destination = self.world.get_random_location_from_navigation()
+                    if destination is not None:
+                        break
+
+                if destination is not None:
+                    # Set walk to random point
+                    controller.go_to_location(destination)
+                    # Set max speed
+                    controller.set_max_speed(float(walker_speeds[int(i/2)]))
+                    successful_walkers += 1
+                else:
+                    print(f"Warning: Could not find valid destination for walker {i//2}")
+                    # Stop the controller if we can't find a destination
+                    controller.stop()
+
+            except Exception as e:
+                print(f"Error initializing walker {i//2}: {e}")
+                try:
+                    controller.stop()
+                except:
+                    pass
 
         print(f"Spawned {len(walkers_list)} pedestrians successfully")
 
