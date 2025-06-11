@@ -79,15 +79,13 @@ class CarlaSensorDataCollector:
         self.args = args
         self.output_dir = args.output_dir
         self.map_name = args.map
+        self.port = args.port
         self.weather = args.weather
         self.number_of_vehicles = args.number_of_vehicles
         self.number_of_walkers = args.number_of_walkers
         self.sync = args.sync
         self.no_render = args.no_render
         self.spawn_point_idx = args.spawn_point
-
-        # Create output directories
-        self._setup_output_directories()
 
         # Docker setup
         self.docker_image = None
@@ -97,25 +95,32 @@ class CarlaSensorDataCollector:
         self.frame_count = 0
         self.sensor_data_received = {}  # Track which sensors have reported
         self.sensor_data = {}  # Store sensor data before writing to disk
-        self.num_sensors = 9  # Total number of sensors we expect (3 RGB, 3 depth, 3 semantic)
+        self.sensor_configs = self._get_sensor_configurations()
+        self.num_sensors = len(self.sensor_configs)
         self.frame_ready = False  # Flag to indicate if a frame is complete
 
+        # Create output directories
+        self._setup_output_directories()
+
     def _setup_output_directories(self):
-        """Create output directories for different sensor types if they don't exist"""
+        """Create output directories based on sensor configurations"""
         # Main output directory
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        # Subdirectories for different sensor types and perspectives
-        perspectives = ['left', 'central', 'right']
-        sensor_types = ['RGB', 'DEPTH', 'SS']
-        additional_sensor_types = ['CAN']
+        # Create directories for each unique sensor
+        created_dirs = set()
+        for config in self.sensor_configs:
+            dir_path = os.path.join(
+                self.output_dir,
+                config['sensor_name'],
+                config['perspective']
+            )
+            if dir_path not in created_dirs:
+                os.makedirs(dir_path, exist_ok=True)
+                created_dirs.add(dir_path)
 
-        for sensor_type in sensor_types:
-            for perspective in perspectives:
-                dir_path = os.path.join(self.output_dir, sensor_type, perspective)
-                if not os.path.exists(dir_path):
-                    os.makedirs(dir_path)
+        print(f"Created {len(created_dirs)} output directories")
 
     def start(self):
         """Start the CARLA client and set up the simulation"""
@@ -128,45 +133,67 @@ class CarlaSensorDataCollector:
             self.client = carla.Client(self.args.host, self.args.port)
             self.client.set_timeout(10.0)
 
-            # Load desired map if specified and different from current
+            # Get current map
             current_map = self.client.get_world().get_map().name
-            # available_maps = self.client.get_available_maps()
-            # print("Available Maps:", available_maps)
-            current_map = self.client.get_world().get_map().name
-            # desired_map = f"/Game/Carla/Maps/{self.map_name}" if not self.map_name.startswith('/') else self.map_name
-            # desired_map = self.map_name
 
             if not current_map.endswith(self.map_name):
                 print(f"Loading map {self.map_name}...")
                 self.world = self.client.load_world(self.map_name)
 
+                # Wait for the map to load
+                print("Waiting for map to load...")
+                time.sleep(2.0)
+
                 # CRITICAL: Reload the map to fix pedestrian spawning at wrong Z levels
-                # This is a known workaround for a CARLA bug
                 print(f"Reloading map {self.map_name} to fix pedestrian spawning...")
                 self.world = self.client.reload_world()
 
-                # Wait for the map to fully load and navigation mesh to initialize
-                print("Waiting for navigation mesh to initialize...")
-                for _ in range(10):  # Wait up to 10 ticks
-                    if self.sync:
-                        self.world.tick()
-                    else:
-                        time.sleep(0.1)
+                # Wait for reload to complete and reconnect if necessary
+                print("Waiting for reload to complete...")
+                time.sleep(3.0)
+
+                # Try to reconnect and get the world again
+                try:
+                    self.world = self.client.get_world()
+                except:
+                    print("Reconnecting to server after reload...")
+                    time.sleep(2.0)
+                    self.client = carla.Client(self.args.host, self.args.port)
+                    self.client.set_timeout(30.0)
+                    self.world = self.client.get_world()
+
             else:
-                print(f"Map {self.map_name} is already loaded, using current map {current_map}")
+                print(f"Map {self.map_name} is already loaded")
                 self.world = self.client.get_world()
 
                 # Even if the map is already loaded, reload it to ensure proper pedestrian spawning
                 print(f"Reloading current map to fix pedestrian spawning...")
                 self.world = self.client.reload_world()
 
-                # Wait for the map to fully load and navigation mesh to initialize
-                print("Waiting for navigation mesh to initialize...")
-                for _ in range(10):  # Wait up to 10 ticks
-                    if self.sync:
-                        self.world.tick()
-                    else:
-                        time.sleep(0.1)
+                # Wait and reconnect
+                print("Waiting for reload to complete...")
+                time.sleep(3.0)
+
+                try:
+                    self.world = self.client.get_world()
+                except:
+                    print("Reconnecting to server after reload...")
+                    time.sleep(2.0)
+                    self.client = carla.Client(self.args.host, self.args.port)
+                    self.client.set_timeout(30.0)
+                    self.world = self.client.get_world()
+
+            # Verify connection is stable
+            print("Verifying connection...")
+            for i in range(5):
+                try:
+                    _ = self.world.get_actors()
+                    break
+                except:
+                    if i == 4:
+                        raise RuntimeError("Failed to establish stable connection after map reload")
+                    print(f"Connection attempt {i+1}/5...")
+                    time.sleep(1.0)
 
             # Set up synchronous mode if requested
             settings = self.world.get_settings()
@@ -203,6 +230,14 @@ class CarlaSensorDataCollector:
                 # Crucial before spawning actors: seed everything!
                 random.seed(self.args.seed)
 
+            # Wait for navigation mesh to initialize
+            print("Waiting for navigation mesh to initialize...")
+            if self.sync:
+                for _ in range(10):
+                    self.world.tick()
+            else:
+                time.sleep(2.0)
+
             # Spawn ego vehicle, pedestrians, and other vehicles
             self._spawn_ego_vehicle()
             self._setup_sensors()
@@ -214,6 +249,10 @@ class CarlaSensorDataCollector:
 
         except KeyboardInterrupt:
             print('\nCancelled by user.')
+        except Exception as e:
+            print(f'Error during startup: {e}')
+            import traceback
+            traceback.print_exc()
         finally:
             self.cleanup()
 
@@ -313,89 +352,138 @@ class CarlaSensorDataCollector:
         else:
             time.sleep(1)
 
-    def _setup_sensors(self):
-        """Set up all sensors for the ego vehicle"""
-        bound_x = 2.9508416652679443  # For Lincoln MKZ 2017
+    def _get_sensor_configurations(self):
+        """Define all sensor configurations in a flexible structure"""
+        # Vehicle bounds for positioning (Lincoln MKZ 2017)
+        bound_x = 2.9508416652679443
         bound_y = 1.5641621351242065
         bound_z = 1.255373239517212
 
-        # Define sensor configurations
-        sensor_configs = [
-            # RGB cameras
-            {'type': 'sensor.camera.rgb', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'RGB_central'},
+        # Common camera settings
+        default_cam_settings = {
+            'width': 960,
+            'height': 540,
+            'fov': 45
+        }
 
-            {'type': 'sensor.camera.rgb', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': -46,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'RGB_left'},
+        # Define sensor groups with their specific settings
+        sensor_groups = [
+            # Front-facing cameras (left, central, right views)
+            {
+                'sensors': ['RGB', 'DEPTH', 'SS', 'IS'],
+                'perspectives': [
+                    {'name': 'central', 'yaw': 0.0},
+                    {'name': 'left', 'yaw': -46.0},
+                    {'name': 'right', 'yaw': 46.0}
+                ],
+                'position': {
+                    'x': 0.0 * bound_x + 0.75,
+                    'y': -0.2 * bound_y,
+                    'z': 1.0 * bound_z - 0.05
+                },
+                'rotation': {'roll': 0.0, 'pitch': 0.0}
+            },
 
-            {'type': 'sensor.camera.rgb', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 46.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'RGB_right'},
+            # Bird's Eye View cameras with custom settings
+            {
+                'sensors': ['RGB', 'SS'],
+                'perspectives': [{'name': 'BEV', 'yaw': 0.0}],
+                'position': {'x': 0, 'y': 0, 'z': 25},  # Positioned above the vehicle
+                'rotation': {'roll': 0.0, 'pitch': -90.0},  # Looking down
+                'custom_settings': {
+                    'width': 600,
+                    'height': 800,  # Vertical orientation
+                    'fov': 60  # Different FOV for BEV
+                }
+            },
 
-            # Depth cameras
-            {'type': 'sensor.camera.depth', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'DEPTH_central'},
-
-            {'type': 'sensor.camera.depth', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': -46,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'DEPTH_left'},
-
-            {'type': 'sensor.camera.depth', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 46.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'DEPTH_right'},
-
-            # Semantic Segmentation cameras
-            {'type': 'sensor.camera.semantic_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'SS_central'},
-
-            {'type': 'sensor.camera.semantic_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': -46,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'SS_left'},
-
-            {'type': 'sensor.camera.semantic_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 46.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'SS_right'},
-
-            # Instance Segmentation cameras
-            {'type': 'sensor.camera.instance_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-                'width': 960, 'height': 540, 'fov': 45, 'id': 'IS_central'},
-
-            {'type': 'sensor.camera.instance_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': -46,
-                'width': 960, 'height': 540, 'fov': 45, 'id': 'IS_left'},
-
-            {'type': 'sensor.camera.instance_segmentation', 'x': 0.0*bound_x+0.75, 'y': -0.2*bound_y, 'z': 1.0*bound_z-0.05, 'roll': 0.0, 'pitch': 0.0, 'yaw': 46.0,
-                'width': 960, 'height': 540, 'fov': 45, 'id': 'IS_right'},
-
-            # BEV cameras, one RGB and one semantic segmentation
-            {'type': 'sensor.camera.rgb', 'x': 0, 'y': 0, 'z': 10, 'roll': 90.0, 'pitch': 90.0, 'yaw': 0.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'BEV_RGB'},
-
-            {'type': 'sensor.camera.semantic_segmentation', 'x': 0, 'y': 0, 'z': 10, 'roll': 90.0, 'pitch': 90.0, 'yaw': 0.0,
-             'width': 960, 'height': 540, 'fov': 45, 'id': 'BEV_SS'},
-
+            # You can easily add more sensor groups here
+            # Example: Side view cameras
+            # {
+            #     'sensors': ['RGB'],
+            #     'perspectives': [
+            #         {'name': 'left_side', 'yaw': -90.0},
+            #         {'name': 'right_side', 'yaw': 90.0}
+            #     ],
+            #     'position': {'x': 0, 'y': 0, 'z': bound_z},
+            #     'rotation': {'roll': 0.0, 'pitch': 0.0}
+            # }
         ]
 
-        # Create all sensors
+        # Sensor type mapping
+        sensor_types = {
+            'RGB': 'sensor.camera.rgb',
+            'DEPTH': 'sensor.camera.depth',
+            'SS': 'sensor.camera.semantic_segmentation',
+            'IS': 'sensor.camera.instance_segmentation'
+        }
+
+        # Generate full sensor configurations
+        configs = []
+        for group in sensor_groups:
+            # Use custom settings if provided, otherwise use defaults
+            settings = group.get('custom_settings', default_cam_settings)
+
+            for sensor_name in group['sensors']:
+                for perspective in group['perspectives']:
+                    config = {
+                        'type': sensor_types[sensor_name],
+                        'sensor_name': sensor_name,
+                        'perspective': perspective['name'],
+                        'id': f"{sensor_name}_{perspective['name']}",
+                        'x': group['position']['x'],
+                        'y': group['position']['y'],
+                        'z': group['position']['z'],
+                        'roll': group['rotation']['roll'],
+                        'pitch': group['rotation']['pitch'],
+                        'yaw': perspective['yaw'],
+                        **settings  # Unpack the settings (width, height, fov)
+                    }
+                    configs.append(config)
+
+        return configs
+
+    def _setup_sensors(self):
+        """Set up all sensors for the ego vehicle"""
         blueprint_library = self.world.get_blueprint_library()
-        for sensor_config in sensor_configs:
+
+        for config in self.sensor_configs:
             # Get the blueprint for the sensor
-            sensor_bp = blueprint_library.find(sensor_config['type'])
+            sensor_bp = blueprint_library.find(config['type'])
 
             # Set sensor attributes
-            sensor_bp.set_attribute('image_size_x', str(sensor_config['width']))
-            sensor_bp.set_attribute('image_size_y', str(sensor_config['height']))
-            sensor_bp.set_attribute('fov', str(sensor_config['fov']))
+            sensor_bp.set_attribute('image_size_x', str(config['width']))
+            sensor_bp.set_attribute('image_size_y', str(config['height']))
+            sensor_bp.set_attribute('fov', str(config['fov']))
 
-            # Create sensor location and rotation
-            sensor_location = carla.Location(x=sensor_config['x'], y=sensor_config['y'], z=sensor_config['z'])
-            sensor_rotation = carla.Rotation(pitch=sensor_config['pitch'], roll=sensor_config['roll'], yaw=sensor_config['yaw'])
+            # Create sensor transform
+            sensor_location = carla.Location(
+                x=config['x'],
+                y=config['y'],
+                z=config['z']
+            )
+            sensor_rotation = carla.Rotation(
+                pitch=config['pitch'],
+                roll=config['roll'],
+                yaw=config['yaw']
+            )
             sensor_transform = carla.Transform(sensor_location, sensor_rotation)
 
             # Spawn the sensor
-            sensor = self.world.spawn_actor(sensor_bp, sensor_transform, attach_to=self.ego_vehicle)
+            sensor = self.world.spawn_actor(
+                sensor_bp,
+                sensor_transform,
+                attach_to=self.ego_vehicle
+            )
             self.sensors.append(sensor)
 
-            # Set up callback to collect the data for each "camera" sensor
-            if sensor_config['type'] in ['sensor.camera.rgb',
-                                         'sensor.camera.depth',
-                                         'sensor.camera.semantic_segmentation',
-                                         'sensor.camera.instance_segmentation']:
-                sensor.listen(lambda image, sensor_id=sensor_config['id']: self.camera_callback(image, sensor_id))
+            # Set up callback
+            sensor.listen(
+                lambda image, sensor_id=config['id']:
+                self.camera_callback(image, sensor_id)
+            )
+
+            print(f"Spawned sensor: {config['id']}")
 
         # Wait for sensors to be ready
         if self.sync:
@@ -420,30 +508,49 @@ class CarlaSensorDataCollector:
 
     def _save_frame_data(self):
         """Save data for all sensors for the current frame"""
-        # Map sensor types to their palettes and file extensions
-        sensor_configs = {
-            'RGB': {'palette': carla.ColorConverter.Raw, 'ext': 'jpg'},
-            'DEPTH': {'palette': carla.ColorConverter.Depth, 'ext': 'png'},
-            'SS': {'palette': carla.ColorConverter.CityScapesPalette, 'ext': 'png'},
-            'IS': {'palette': carla.ColorConverter.Raw, 'ext': 'png'},
-
+        # Sensor processing configurations
+        processing_configs = {
+            'RGB': {
+                'palette': carla.ColorConverter.Raw,
+                'extension': 'jpg'
+            },
+            'DEPTH': {
+                'palette': carla.ColorConverter.Depth,
+                'extension': 'png'
+            },
+            'SS': {
+                'palette': carla.ColorConverter.CityScapesPalette,
+                'extension': 'png'
+            },
+            'IS': {
+                'palette': carla.ColorConverter.Raw,
+                'extension': 'png'
+            }
         }
 
-        for sensor_type, config in sensor_configs.items():
-            for direction in ['left', 'central', 'right']:
-                sensor_id = f'{sensor_type}_{direction}'
-                if sensor_id in self.sensor_data:
-                    # Create the directory if it doesn't exist
-                    dir_path = os.path.join(self.output_dir, sensor_type, direction)
-                    if not os.path.exists(dir_path):
-                        os.makedirs(dir_path)
+        # Save each sensor's data
+        for config in self.sensor_configs:
+            sensor_id = config['id']
 
-                    # Save the image to disk
-                    save_path = os.path.join(dir_path, f'{sensor_type}_{direction}_{self.frame_count:06d}.{config["ext"]}')
+            if sensor_id in self.sensor_data:
+                # Get processing config
+                proc_config = processing_configs.get(
+                    config['sensor_name'],
+                    {'palette': carla.ColorConverter.Raw, 'extension': 'png'}
+                )
 
-                    # Apply palette if specified and save
-                    self.sensor_data[sensor_id].convert(config['palette'])
-                    self.sensor_data[sensor_id].save_to_disk(save_path)
+                # Build save path
+                dir_path = os.path.join(
+                    self.output_dir,
+                    config['sensor_name'],
+                    config['perspective']
+                )
+                filename = f"{sensor_id}_{self.frame_count:06d}.{proc_config['extension']}"
+                save_path = os.path.join(dir_path, filename)
+
+                # Apply palette and save
+                self.sensor_data[sensor_id].convert(proc_config['palette'])
+                self.sensor_data[sensor_id].save_to_disk(save_path)
 
         # Clear the data storage after saving
         self.sensor_data = {}
